@@ -52,7 +52,7 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
 </style>
 """, unsafe_allow_html=True)
 
-CODE_RE = re.compile(r'[CcĆć]\s*(\d{1,5})')
+CODE_RE = re.compile(r'\bC\s*(\d{2,5})\b')
 
 # ═══════════════════════════════════════════════════════════════
 # AUTENTICACIÓN
@@ -139,7 +139,7 @@ def claude_vision_read(img_b64, api_key):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                {"type": "text", "text": "Lee el código manuscrito de esta imagen. Es formato C seguido de números (ej: C1098, C50, C294). Respondé SOLO el código, nada más."}
+                {"type": "text", "text": "En esta imagen del margen superior izquierdo de una hoja hay un código MANUSCRITO grande escrito a mano con marcador grueso. El formato es la letra C seguida de números, por ejemplo: C1098, C50, C294, C1013. IGNORA completamente cualquier texto impreso o tipografiado. Lee SOLAMENTE el codigo manuscrito grande. Responde UNICAMENTE el codigo (ej: C294), nada mas. Si no hay codigo manuscrito responde NO."}
             ]
         }]
     })
@@ -152,8 +152,10 @@ def claude_vision_read(img_b64, api_key):
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
             text = data.get("content", [{}])[0].get("text", "").strip()
-            m = re.match(r'(C\d{1,5})', text)
-            return m.group(1) if m else text if text.startswith('C') else None
+            if text.upper() == "NO" or not text:
+                return None
+            m = re.match(r'(C\d{2,5})', text)
+            return m.group(1) if m else None
     except Exception:
         return None
 
@@ -216,7 +218,7 @@ def _process_candidate(pdf_path, pg, api_key):
 
     # 1. Text extraction (instant)
     for blk in page.get_text("blocks"):
-        if blk[1] < page.rect.height * 0.15 and blk[0] < page.rect.width * 0.40:
+        if blk[1] < page.rect.height * 0.07 and blk[0] < page.rect.width * 0.25:
             m = CODE_RE.findall(blk[4] if len(blk) > 4 else "")
             if m:
                 doc.close()
@@ -227,7 +229,7 @@ def _process_candidate(pdf_path, pg, api_key):
     pix = page.get_pixmap(matrix=mat)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
-    crop = img.crop((0, 0, int(img.width * 0.35), int(img.height * 0.18)))
+    crop = img.crop((0, 0, int(img.width * 0.25), int(img.height * 0.07)))
 
     # 3. Claude Vision (if API key available)
     if api_key:
@@ -502,4 +504,4 @@ if uploaded_pdf:
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div style="text-align:center;padding:3rem 0 1.5rem;border-top:1px solid rgba(59,130,246,.06);margin-top:2rem"><p style="font-size:.72rem;color:#475569;letter-spacing:.5px;font-family:\'DM Sans\',sans-serif">FOLIADOR DE OBRAS SOCIALES · v4.2 · Claude Haiku Vision + cruce con base + acceso protegido</p></div>', unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;padding:3rem 0 1.5rem;border-top:1px solid rgba(59,130,246,.06);margin-top:2rem"><p style="font-size:.72rem;color:#475569;letter-spacing:.5px;font-family:\'DM Sans\',sans-serif">FOLIADOR DE OBRAS SOCIALES · v4.3 · Detección enfocada en margen manuscrito</p></div>', unsafe_allow_html=True)
