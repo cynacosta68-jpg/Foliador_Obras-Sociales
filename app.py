@@ -416,7 +416,7 @@ if uploaded_pdf:
         results = st.session_state['results']
         candidates = st.session_state['candidates']
         if candidates:
-            st.markdown("**Páginas con código detectado:**")
+            st.markdown("**Páginas candidatas** — descartá las que no tengan código manuscrito:")
             doc2 = fitz.open(st.session_state.get('pdf_path', tmp_path))
             per_page = 12
             total_groups = math.ceil(len(candidates)/per_page)
@@ -444,7 +444,20 @@ if uploaded_pdf:
                                 tag = '<span class="no-tag">no leído</span>'; mtag = ''
                             st.markdown(f'<div class="code-card"><img src="data:image/jpeg;base64,{thumb}"/><div class="page-num">Pág. {pg+1}</div>{tag}{mtag}</div>', unsafe_allow_html=True)
                         except: st.text(f"Pág. {pg+1}")
+                        if st.button("✕ Descartar", key=f"dismiss_{pg}", use_container_width=True):
+                            st.session_state['candidates'] = [c for c in candidates if c != pg]
+                            st.session_state['results'].pop(pg, None)
+                            st.session_state['rebuild_table'] = True
+                            st.rerun()
             doc2.close()
+
+            # Bulk dismiss
+            no_leidas = [pg for pg in candidates if pg not in results]
+            if no_leidas:
+                if st.button(f"🗑️  Descartar todas las no leídas ({len(no_leidas)} páginas)", use_container_width=True):
+                    st.session_state['candidates'] = [c for c in candidates if c in results]
+                    st.session_state['rebuild_table'] = True
+                    st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ── PASO 3 ──
