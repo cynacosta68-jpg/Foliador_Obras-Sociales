@@ -4,6 +4,7 @@ import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 import re
+import unicodedata
 import io
 import math
 import json
@@ -112,27 +113,87 @@ def get_api_key():
 # BASE DE USUARIOS
 # ═══════════════════════════════════════════════════════════════
 
+def _norm_col(name):
+    """Nombre de columna sin acentos, espacios, puntos ni mayúsculas."""
+    t = unicodedata.normalize('NFKD', str(name)).encode('ascii', 'ignore').decode().lower()
+    return re.sub(r'[^a-z0-9]', '', t)
+
+def norm_code(value):
+    """Normaliza una cuenta/matrícula para comparar: 'c-1146', 'C 1146', 1146, 1146.0, '01146' → 'C1146'."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    t = str(value).strip().upper()
+    t = re.sub(r'\.0+$', '', t)
+    t = re.sub(r'[^A-Z0-9]', '', t)
+    m = re.fullmatch(r'C?0*(\d+)', t)
+    return f"C{m.group(1)}" if m else t
+
+BASE_ALIASES = {
+    'Matricula': ['matricula', 'matriculas', 'mat', 'cuenta', 'nrocuenta', 'numerocuenta', 'ncuenta', 'codigo', 'cod', 'codigocuenta'],
+    'Nombre': ['nombre', 'profesional', 'apellidoynombre', 'nombreyapellido', 'razonsocial', 'prestador', 'nombres'],
+    'CUIT': ['cuit', 'cuil', 'cuitcuil', 'nrocuit', 'numerocuit'],
+    'Especialidad': ['especialidad', 'especialidades', 'esp'],
+    'Responsabilidad Fiscal': ['responsabilidadfiscal', 'respfiscal', 'condicionfiscal', 'condicioniva', 'condiva', 'iva', 'situacionfiscal'],
+    'Arancel': ['arancel', 'aranceles', 'categoria'],
+}
+
+def _map_columns(columns):
+    norm = {_norm_col(c): c for c in columns}
+    return {field: next((norm[a] for a in aliases if a in norm), None) for field, aliases in BASE_ALIASES.items()}
+
+def _fmt(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)): return ""
+    t = str(v).strip()
+    return "" if t.lower() in ("nan", "none", "nat") else t
+
+def _fmt_cuit(v):
+    t = _fmt(v)
+    if not t: return ""
+    try:
+        return str(int(float(t))) if re.fullmatch(r'[\d.]+(e\+?\d+)?', t.lower()) and t.count('.') <= 1 else t
+    except Exception:
+        return t
+
 @st.cache_data
 def load_base(file_bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    df.columns = df.columns.str.strip()
+    """Lee la base. Devuelve (lookup, filas, columnas_mapeadas, columnas_originales)."""
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, dtype=object)
+    best = None
+    for raw in sheets.values():
+        # El encabezado puede no estar en la primera fila: buscar la fila con la columna de matrícula
+        for r in range(min(15, len(raw))):
+            cols = [_fmt(c) for c in raw.iloc[r].tolist()]
+            cmap = _map_columns(cols)
+            if cmap['Matricula']:
+                df = raw.iloc[r + 1:].copy(); df.columns = cols
+                score = sum(1 for v in cmap.values() if v)
+                if best is None or score > best[0]:
+                    best = (score, df, cmap, cols)
+                break
+    if best is None:
+        first = next(iter(sheets.values())) if sheets else pd.DataFrame()
+        cols = [_fmt(c) for c in first.iloc[0].tolist()] if len(first) else []
+        return {}, len(first), {}, cols
+    _, df, cmap, cols = best
+    df = df.loc[:, [c for c in dict.fromkeys(df.columns) if c]]
+    df = df.loc[:, ~df.columns.duplicated()]
     lookup = {}
+    get = lambda row, f: row[cmap[f]] if cmap.get(f) else ""
     for _, row in df.iterrows():
-        mat = str(row.get('Matricula', '')).strip()
-        if mat:
+        mat = norm_code(get(row, 'Matricula'))
+        if mat and mat not in lookup:
             lookup[mat] = {
-                'Nombre': str(row.get('Nombre', '')).strip(),
-                'CUIT': row.get('CUIT', ''),
-                'Especialidad': str(row.get('Especialidad', '')).strip(),
-                'Responsabilidad Fiscal': str(row.get('Responsabilidad Fiscal', '')).strip(),
-                'Arancel': str(row.get('Arancel', '')).strip(),
+                'Nombre': _fmt(get(row, 'Nombre')),
+                'CUIT': _fmt_cuit(get(row, 'CUIT')),
+                'Especialidad': _fmt(get(row, 'Especialidad')),
+                'Responsabilidad Fiscal': _fmt(get(row, 'Responsabilidad Fiscal')),
+                'Arancel': _fmt(get(row, 'Arancel')),
             }
-    return lookup, len(df)
+    return lookup, len(df), cmap, [c for c in cols if c]
 
 def do_lookup(code, base):
     if not base or not code: return None
-    code = code.strip()
-    return base.get(code)
+    return base.get(norm_code(code))
 
 # ═══════════════════════════════════════════════════════════════
 # OCR ENGINES
@@ -370,12 +431,15 @@ def build_ranges(code_pages, total):
 
 def apply_lookup(df, base):
     out = df.copy()
+    for col in ['Cuenta', 'Profesional', 'CUIT', 'Especialidad', 'Resp. Fiscal', 'Arancel']:
+        if col not in out.columns: out[col] = ""
+        out[col] = out[col].astype(object).where(out[col].notna(), "")
     for idx, row in out.iterrows():
         code = str(row.get('Cuenta', '')).strip()
         info = do_lookup(code, base)
         if info:
             out.at[idx, 'Profesional'] = info['Nombre']
-            out.at[idx, 'CUIT'] = str(int(info['CUIT'])) if pd.notna(info.get('CUIT')) else ""
+            out.at[idx, 'CUIT'] = info['CUIT']
             out.at[idx, 'Especialidad'] = info['Especialidad']
             out.at[idx, 'Resp. Fiscal'] = info['Responsabilidad Fiscal']
             out.at[idx, 'Arancel'] = info['Arancel']
@@ -445,9 +509,24 @@ if not api_key:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-base_lookup, base_count = {}, 0
+base_lookup, base_count, base_sig = {}, 0, None
 if uploaded_base:
-    base_lookup, base_count = load_base(uploaded_base.read()); uploaded_base.seek(0)
+    base_bytes = uploaded_base.getvalue()
+    base_sig = (uploaded_base.name, len(base_bytes))
+    try:
+        base_lookup, base_count, base_cols, base_all_cols = load_base(base_bytes)
+    except Exception as e:
+        base_cols, base_all_cols = {}, []
+        st.error(f"No se pudo leer la base de usuarios: {e}")
+    else:
+        if not base_lookup:
+            st.error("No encontré en la base una columna de matrícula/cuenta (busco: **Matricula**, Cuenta, Código). "
+                     f"Columnas encontradas: {', '.join(base_all_cols) or 'ninguna'}.")
+        else:
+            faltan = [f for f in BASE_ALIASES if not base_cols.get(f)]
+            if faltan:
+                st.warning(f"La base no tiene las columnas: {', '.join(faltan)}. Esos datos quedarán vacíos. "
+                           f"Columnas encontradas: {', '.join(base_all_cols)}.")
 
 if uploaded_pdf:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -469,7 +548,7 @@ if uploaded_pdf:
         results, candidates = full_scan(tmp_path, total, api_key, lambda p, m: bar.progress(min(p,1.0), text=m))
         elapsed = time.time() - t0
         bar.empty()
-        st.session_state.update({'results': results, 'candidates': candidates, 'scanned': True, 'pdf_path': tmp_path})
+        st.session_state.update({'results': results, 'candidates': candidates, 'scanned': True, 'pdf_path': tmp_path, 'rebuild_table': True, 'base_sig': base_sig})
 
         matches = sum(1 for _, (c, _) in results.items() if do_lookup(c, base_lookup))
         st.markdown(f'<div class="stat-row"><div class="stat-box"><div class="stat-number">{len(candidates)}</div><div class="stat-label">Separadoras</div></div><div class="stat-box"><div class="stat-number">{len(results)}</div><div class="stat-label">Leídos</div></div><div class="stat-box"><div class="stat-number">{matches}/{len(results)}</div><div class="stat-label">Cruzados</div></div><div class="stat-box"><div class="stat-number">{elapsed:.1f}s</div><div class="stat-label">Tiempo</div></div></div>', unsafe_allow_html=True)
@@ -546,7 +625,7 @@ if uploaded_pdf:
                     info = do_lookup(code, base_lookup)
                     rows.append({"Cuenta": code, "Página desde": s, "Página hasta": e,
                                  "Profesional": info['Nombre'] if info else "",
-                                 "CUIT": str(int(info['CUIT'])) if info and pd.notna(info.get('CUIT')) else "",
+                                 "CUIT": info['CUIT'] if info else "",
                                  "Especialidad": info['Especialidad'] if info else "",
                                  "Resp. Fiscal": info['Responsabilidad Fiscal'] if info else "",
                                  "Arancel": info['Arancel'] if info else ""})
@@ -554,8 +633,26 @@ if uploaded_pdf:
                 rows = [{"Cuenta":"","Página desde":1,"Página hasta":total,"Profesional":"","CUIT":"","Especialidad":"","Resp. Fiscal":"","Arancel":""}]
             st.session_state['table_df'] = pd.DataFrame(rows)
             st.session_state['rebuild_table'] = False
+            st.session_state['editor_v'] = st.session_state.get('editor_v', 0) + 1
 
-        edited = st.data_editor(st.session_state['table_df'], use_container_width=True, num_rows="dynamic", hide_index=True,
+        # Cruce automático: si se cargó o cambió la base después de escanear, completar la tabla
+        if has_base and st.session_state.get('base_sig') != base_sig:
+            st.session_state['table_df'] = apply_lookup(st.session_state['table_df'], base_lookup)
+            st.session_state['base_sig'] = base_sig
+            st.session_state['editor_v'] = st.session_state.get('editor_v', 0) + 1
+
+        if has_base:
+            tdf = st.session_state['table_df']
+            con = sum(1 for c in tdf['Cuenta'] if do_lookup(str(c), base_lookup))
+            sin = [str(c) for c in tdf['Cuenta'] if str(c).strip() and not do_lookup(str(c), base_lookup)]
+            if sin:
+                st.warning(f"**{con}/{len(tdf)}** cuentas cruzadas con la base. Sin coincidencia: {', '.join(sin[:30])}{'…' if len(sin) > 30 else ''}")
+            else:
+                st.success(f"**{con}/{len(tdf)}** cuentas cruzadas con la base.")
+        else:
+            st.info("Cargá la **Base de usuarios** (.xlsx) en el Paso 1 para completar Profesional, CUIT, Especialidad, Resp. Fiscal y Arancel.")
+
+        edited = st.data_editor(st.session_state['table_df'], key=f"editor_{st.session_state.get('editor_v', 0)}", use_container_width=True, num_rows="dynamic", hide_index=True,
             column_config={
                 "Cuenta": st.column_config.TextColumn("Cuenta", width="small"),
                 "Página desde": st.column_config.NumberColumn("Pág. desde", width="small", min_value=1, max_value=total),
@@ -571,8 +668,7 @@ if uploaded_pdf:
             if st.button("🔄  Re-cruzar con base", use_container_width=True):
                 updated = apply_lookup(edited, base_lookup)
                 st.session_state['table_df'] = updated
-                matched = sum(1 for _, r in updated.iterrows() if str(r.get('Profesional','')).strip())
-                st.success(f"**{matched}/{len(updated)}** cruzados con la base.")
+                st.session_state['editor_v'] = st.session_state.get('editor_v', 0) + 1
                 st.rerun()
 
         st.session_state['final_df'] = edited
