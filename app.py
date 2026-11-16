@@ -424,10 +424,12 @@ def get_thumb_b64(doc, pg, width=220):
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-def build_ranges(code_pages, total):
-    entries = sorted(code_pages.items())
-    return [(code, pg+1, entries[i+1][0] if i+1 < len(entries) else total)
-            for i, (pg, (code, _)) in enumerate(entries)]
+def build_ranges(code_pages, total, candidates=None):
+    """Una fila por hoja separadora detectada. Las que no se pudieron leer
+    quedan con la cuenta vacía para completarla a mano."""
+    pages = sorted(set(code_pages) | set(candidates or []))
+    return [(code_pages[pg][0] if pg in code_pages else "", pg+1, pages[i+1] if i+1 < len(pages) else total)
+            for i, pg in enumerate(pages)]
 
 def apply_lookup(df, base):
     out = df.copy()
@@ -560,7 +562,9 @@ if uploaded_pdf:
         elif results:
             st.warning("Códigos detectados pero sin match. Corregí en la tabla y re-cruzá.")
         else:
-            st.warning("No se detectaron hojas separadoras con cuenta manuscrita. Ingresá las cuentas manualmente.")
+            st.warning("No se pudo leer ninguna cuenta. Ingresalas manualmente en la tabla.")
+        if len(candidates) > len(results):
+            st.info(f"**{len(candidates) - len(results)}** hojas detectadas no se pudieron leer: quedan en la tabla con la cuenta vacía para completarla a mano.")
 
     if st.session_state.get('scanned'):
         results = st.session_state['results']
@@ -615,11 +619,11 @@ if uploaded_pdf:
         results = st.session_state['results']
         has_base = bool(base_lookup)
         st.markdown('<div class="card"><span class="step-badge">Paso 3</span><div class="card-title">Confirmar, editar y cruzar</div>', unsafe_allow_html=True)
-        st.markdown('<p class="info-text">Corregí los códigos mirando las miniaturas. Después presioná <b>Re-cruzar</b> para actualizar los datos del profesional.</p>', unsafe_allow_html=True)
+        st.markdown('<p class="info-text">Corregí los códigos mirando las miniaturas. Las hojas <b>no leídas</b> aparecen con la cuenta vacía: escribila a mano. Después presioná <b>Re-cruzar</b> para actualizar los datos del profesional.</p>', unsafe_allow_html=True)
 
         if 'table_df' not in st.session_state or st.session_state.get('rebuild_table'):
-            if results:
-                ranges = build_ranges(results, total)
+            ranges = build_ranges(results, total, st.session_state.get('candidates', []))
+            if ranges:
                 rows = []
                 for code, s, e in ranges:
                     info = do_lookup(code, base_lookup)
@@ -644,11 +648,13 @@ if uploaded_pdf:
         if has_base:
             tdf = st.session_state['table_df']
             con = sum(1 for c in tdf['Cuenta'] if do_lookup(str(c), base_lookup))
-            sin = [str(c) for c in tdf['Cuenta'] if str(c).strip() and not do_lookup(str(c), base_lookup)]
-            if sin:
-                st.warning(f"**{con}/{len(tdf)}** cuentas cruzadas con la base. Sin coincidencia: {', '.join(sin[:30])}{'…' if len(sin) > 30 else ''}")
-            else:
-                st.success(f"**{con}/{len(tdf)}** cuentas cruzadas con la base.")
+            sin = [str(c) for c in tdf['Cuenta'] if pd.notna(c) and str(c).strip() and not do_lookup(str(c), base_lookup)]
+            vacias = [str(int(r['Página desde'])) for _, r in tdf.iterrows()
+                      if not str(r['Cuenta'] or '').strip() and pd.notna(r['Página desde'])]
+            msg = f"**{con}/{len(tdf)}** cuentas cruzadas con la base."
+            if sin: msg += f" Sin coincidencia: {', '.join(sin[:30])}{'…' if len(sin) > 30 else ''}."
+            if vacias: msg += f" **{len(vacias)}** hojas no leídas (cuenta vacía, completala a mano) en pág.: {', '.join(vacias[:30])}{'…' if len(vacias) > 30 else ''}."
+            (st.warning if sin or vacias else st.success)(msg)
         else:
             st.info("Cargá la **Base de usuarios** (.xlsx) en el Paso 1 para completar Profesional, CUIT, Especialidad, Resp. Fiscal y Arancel.")
 
