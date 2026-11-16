@@ -54,6 +54,14 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
 
 CODE_RE = re.compile(r'\bC\s*(\d{2,5})\b')
 
+# Detección de hojas separadoras (hoja en blanco con la cuenta manuscrita en marcador)
+INK_THRESH = 110            # gris < umbral = tinta
+EDGE_MARGIN = 0.04          # borde ignorado (sombras del escáner)
+SEP_MIN_INK = 0.002         # tinta mínima: descarta hojas totalmente en blanco
+SEP_MAX_INK = 0.12          # tinta máxima: descarta páginas llenas
+SEP_MIN_THICK_RATIO = 0.55  # proporción mínima de tinta en trazo grueso (marcador)
+SEP_MAX_THIN_INK = 0.006    # tinta fina tolerada (texto impreso / ruido)
+
 # ═══════════════════════════════════════════════════════════════
 # AUTENTICACIÓN
 # ═══════════════════════════════════════════════════════════════
@@ -131,7 +139,7 @@ def do_lookup(code, base):
 # ═══════════════════════════════════════════════════════════════
 
 def claude_vision_read(img_b64, api_key):
-    """Use Claude Vision to read a handwritten code from an image."""
+    """Lee con Claude Vision la cuenta manuscrita (C+número) de una hoja separadora."""
     body = json.dumps({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 30,
@@ -139,7 +147,7 @@ def claude_vision_read(img_b64, api_key):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                {"type": "text", "text": "En esta imagen del margen superior izquierdo de una hoja hay un código MANUSCRITO grande escrito a mano con marcador grueso. El formato es la letra C seguida de números, por ejemplo: C1098, C50, C294, C1013. IGNORA completamente cualquier texto impreso o tipografiado. Lee SOLAMENTE el codigo manuscrito grande. Responde UNICAMENTE el codigo (ej: C294), nada mas. Si no hay codigo manuscrito responde NO."}
+                {"type": "text", "text": "Esta imagen es una hoja en blanco usada como separador, con texto MANUSCRITO grande trazado a mano con marcador grueso. Una de las lineas es un codigo de cuenta con el formato: letra C seguida de numeros, por ejemplo C924, C1098, C50, C294. Puede haber ademas otra palabra manuscrita (por ejemplo un nombre o sigla como CEDIG): IGNORALA. Lee SOLAMENTE el codigo de cuenta. Responde UNICAMENTE el codigo (ej: C924), nada mas. Si no hay un codigo manuscrito con ese formato responde NO."}
             ]
         }]
     })
@@ -149,100 +157,162 @@ def claude_vision_read(img_b64, api_key):
         headers={"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read())
-            text = data.get("content", [{}])[0].get("text", "").strip()
-            if text.upper() == "NO" or not text:
+            text = data.get("content", [{}])[0].get("text", "").strip().upper()
+            if text == "NO" or not text:
                 return None
-            m = re.match(r'(C\d{2,5})', text)
-            return m.group(1) if m else None
+            m = re.search(r'\bC\s*(\d{2,5})\b', text)
+            return f"C{m.group(1)}" if m else None
     except Exception:
         return None
 
 
+def _split_lines(mask):
+    """Separa los renglones manuscritos por proyección horizontal. mask: bool array (True = tinta)."""
+    rows = mask.any(axis=1)
+    lines, start = [], None
+    for y, on in enumerate(rows):
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            lines.append((start, y)); start = None
+    if start is not None:
+        lines.append((start, len(rows)))
+    # Unir cortes muy chicos (ej: el punto de una "i") y descartar ruido
+    merged = []
+    for a, b in lines:
+        if merged and a - merged[-1][1] < 0.02 * len(rows):
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return [(a, b) for a, b in merged if b - a >= 0.02 * len(rows)]
+
+
 def tesseract_read(gray_img):
-    """Tesseract multi-strategy OCR (v1 approach)."""
+    """Tesseract sobre cada renglón manuscrito de la hoja separadora."""
+    arr = np.array(gray_img)
+    mask = arr < INK_THRESH
     results = []
-    for thresh in [90, 110, 130, 150, 170]:
-        binary = gray_img.point(lambda x, t=thresh: 0 if x < t else 255, '1')
-        scaled = binary.resize((binary.width * 3, binary.height * 3), Image.LANCZOS)
-        for psm in [6, 7, 11, 13]:
-            for cfg in [f'--psm {psm}', f'--psm {psm} -c tessedit_char_whitelist=Cc0123456789']:
+    for a, b in _split_lines(mask) or [(0, arr.shape[0])]:
+        cols = np.where(mask[a:b].any(axis=0))[0]
+        if len(cols) == 0:
+            continue
+        pad = max(10, (b - a) // 4)
+        line = gray_img.crop((max(0, cols[0] - pad), max(0, a - pad),
+                              min(gray_img.width, cols[-1] + pad), min(gray_img.height, b + pad)))
+        # Normalizar la altura del renglón (~90 px) para Tesseract
+        r = 90 / max(1, line.height)
+        line = line.resize((max(1, int(line.width * r)), 90), Image.LANCZOS)
+        line = Image.merge('L', [line]).point(lambda x: 0 if x < 140 else 255)
+        canvas = Image.new('L', (line.width + 60, line.height + 60), 255)
+        canvas.paste(line, (30, 30))
+        for psm in [7, 8, 13]:
+            try:
+                free = pytesseract.image_to_string(canvas, config=f'--psm {psm}')
+            except Exception:
+                continue
+            found = CODE_RE.findall(free.upper())
+            results.extend(f"C{m}" for m in found)
+            # Solo forzar dígitos si el renglón "parece" numérico (evita leer CEDIG como código)
+            digits = sum(ch.isdigit() for ch in free)
+            letters = sum(ch.isalpha() for ch in free)
+            if digits >= 2 and digits >= letters:
                 try:
-                    text = pytesseract.image_to_string(scaled, config=cfg)
-                    for m in CODE_RE.findall(text):
-                        results.append(f"C{m}")
+                    wl = pytesseract.image_to_string(canvas, config=f'--psm {psm} -c tessedit_char_whitelist=C0123456789')
+                    results.extend(f"C{m}" for m in CODE_RE.findall(wl.upper()))
                 except Exception:
                     pass
-    eroded = gray_img.filter(ImageFilter.MaxFilter(3))
-    be = eroded.point(lambda x: 0 if x < 130 else 255, '1')
-    se = be.resize((be.width * 3, be.height * 3), Image.LANCZOS)
-    for psm in [6, 7]:
-        try:
-            text = pytesseract.image_to_string(se, config=f'--psm {psm}')
-            for m in CODE_RE.findall(text):
-                results.append(f"C{m}")
-        except Exception:
-            pass
     if results:
-        best, cnt = Counter(results).most_common(1)[0]
-        if cnt >= 2:
-            return best
+        return Counter(results).most_common(1)[0][0]
     return None
 
 
 # ═══════════════════════════════════════════════════════════════
 # SCAN ENGINE
 # ═══════════════════════════════════════════════════════════════
+#
+# Criterio: la cuenta ya NO se busca en el margen de la planilla. Ahora cada
+# cuenta viene precedida por una HOJA SEPARADORA: una hoja en blanco con la
+# cuenta "C+NÚMERO" trazada a mano con marcador grueso.
+#   Fase 1 · detectar hojas separadoras (casi vacías + trazo grueso)
+#   Fase 2 · leer la cuenta manuscrita de cada separadora
 
-def phase1_density(pdf_path, total, progress_cb=None):
+def separator_info(gray_img):
+    """Analiza una página (72 dpi, escala de grises).
+    Devuelve (es_separadora, bbox_relativo del manuscrito o None)."""
+    w, h = gray_img.size
+    mx, my = int(w * EDGE_MARGIN), int(h * EDGE_MARGIN)
+    inner = gray_img.crop((mx, my, w - mx, h - my))
+    ink = inner.point(lambda x: 255 if x < INK_THRESH else 0)
+    ink_arr = np.array(ink) > 0
+    ink_frac = float(ink_arr.mean())
+    if not (SEP_MIN_INK <= ink_frac <= SEP_MAX_INK):
+        return False, None
+    # Apertura morfológica: borra el trazo fino (texto impreso, líneas, ruido)
+    # y conserva solo el trazo grueso del marcador.
+    k = 2 * max(1, round(w / 400)) + 1
+    thick = ink.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
+    thick_arr = (np.array(thick) > 0) & ink_arr
+    thick_frac = float(thick_arr.mean())
+    if thick_frac < SEP_MIN_INK * 0.7:
+        return False, None
+    thin_frac = ink_frac - thick_frac
+    if thick_frac / ink_frac < SEP_MIN_THICK_RATIO or thin_frac > SEP_MAX_THIN_INK:
+        return False, None
+    ys, xs = np.where(thick_arr)
+    bh, bw = ys.max() - ys.min() + 1, xs.max() - xs.min() + 1
+    # El manuscrito es grande: descarta manchas, sellos chicos y perforaciones
+    if bw < 0.08 * w or bh < 0.02 * h:
+        return False, None
+    bbox = ((xs.min() + mx) / w, (ys.min() + my) / h, (xs.max() + 1 + mx) / w, (ys.max() + 1 + my) / h)
+    return True, bbox
+
+
+def phase1_separators(pdf_path, total, progress_cb=None):
+    """Devuelve {página: bbox_relativo} de las hojas separadoras manuscritas."""
     doc = fitz.open(pdf_path)
-    densities = []
+    found = {}
     for i in range(total):
-        page = doc[i]
-        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1))
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        crop = img.crop((0, 0, int(img.width * 0.25), int(img.height * 0.06)))
-        densities.append(float(np.mean(np.array(crop.convert('L')) < 100)))
+        pix = doc[i].get_pixmap(matrix=fitz.Matrix(1, 1), colorspace=fitz.csGRAY)
+        img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+        ok, bbox = separator_info(img)
+        if ok:
+            found[i] = bbox
         if progress_cb and i % 100 == 0:
-            progress_cb(0.25 * i / total, f"Fase 1 · Densidad · Pág {i+1:,}/{total:,}")
+            progress_cb(0.25 * i / total, f"Fase 1 · Hojas separadoras · Pág {i+1:,}/{total:,}")
     doc.close()
-    median = float(np.median(densities)) if densities else 0
-    return [i for i, d in enumerate(densities) if d > max(median * 3, 0.02)]
+    return found
 
 
-def _process_candidate(pdf_path, pg, api_key):
-    """Process one candidate: text extraction → Claude Vision → Tesseract fallback."""
+def render_handwriting(pdf_path, pg, bbox, dpi=200):
+    """Renderiza la página y recorta la zona manuscrita (con margen)."""
     doc = fitz.open(pdf_path)
-    page = doc[pg]
-
-    # 1. Text extraction (instant)
-    for blk in page.get_text("blocks"):
-        if blk[1] < page.rect.height * 0.07 and blk[0] < page.rect.width * 0.25:
-            m = CODE_RE.findall(blk[4] if len(blk) > 4 else "")
-            if m:
-                doc.close()
-                return pg, f"C{m[0]}", "text"
-
-    # 2. Render crop
-    mat = fitz.Matrix(250 / 72, 250 / 72)
-    pix = page.get_pixmap(matrix=mat)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    pix = doc[pg].get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), colorspace=fitz.csGRAY)
+    img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
     doc.close()
-    crop = img.crop((0, 0, int(img.width * 0.25), int(img.height * 0.07)))
+    if bbox:
+        x0, y0, x1, y1 = bbox
+        px, py = 0.04, 0.03
+        img = img.crop((int(max(0, x0 - px) * img.width), int(max(0, y0 - py) * img.height),
+                        int(min(1, x1 + px) * img.width), int(min(1, y1 + py) * img.height)))
+    return img
 
-    # 3. Claude Vision (if API key available)
+
+def _process_candidate(pdf_path, pg, bbox, api_key):
+    """Lee la cuenta de una hoja separadora: Claude Vision → Tesseract."""
+    crop = render_handwriting(pdf_path, pg, bbox)
+
     if api_key:
+        small = crop.copy()
+        small.thumbnail((1000, 1000), Image.LANCZOS)
         buf = io.BytesIO()
-        crop.save(buf, format='PNG')
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        code = claude_vision_read(b64, api_key)
+        small.save(buf, format='PNG')
+        code = claude_vision_read(base64.b64encode(buf.getvalue()).decode(), api_key)
         if code:
             return pg, code, "claude"
 
-    # 4. Tesseract fallback
-    gray = crop.convert('L')
-    code = tesseract_read(gray)
+    code = tesseract_read(crop)
     if code:
         return pg, code, "tesseract"
 
@@ -250,9 +320,10 @@ def _process_candidate(pdf_path, pg, api_key):
 
 
 def full_scan(pdf_path, total, api_key="", progress_cb=None):
-    if progress_cb: progress_cb(0.0, "Fase 1 · Detección por densidad...")
-    candidates = phase1_density(pdf_path, total, progress_cb)
-    if progress_cb: progress_cb(0.3, f"Fase 1 · {len(candidates)} candidatas")
+    if progress_cb: progress_cb(0.0, "Fase 1 · Buscando hojas separadoras...")
+    seps = phase1_separators(pdf_path, total, progress_cb)
+    candidates = sorted(seps)
+    if progress_cb: progress_cb(0.3, f"Fase 1 · {len(candidates)} hojas separadoras")
 
     results = {}
     if not candidates:
@@ -261,10 +332,10 @@ def full_scan(pdf_path, total, api_key="", progress_cb=None):
     engine = "Claude Vision" if api_key else "Tesseract OCR"
     workers = min(4, os.cpu_count() or 2) if not api_key else 2  # Less parallel for API
     done = 0
-    if progress_cb: progress_cb(0.35, f"Fase 2 · {engine} en {len(candidates)} candidatas...")
+    if progress_cb: progress_cb(0.35, f"Fase 2 · {engine} en {len(candidates)} hojas...")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_process_candidate, pdf_path, pg, api_key): pg for pg in candidates}
+        futures = {ex.submit(_process_candidate, pdf_path, pg, seps[pg], api_key): pg for pg in candidates}
         for f in as_completed(futures):
             pg, code, method = f.result()
             if code: results[pg] = (code, method)
@@ -278,9 +349,9 @@ def full_scan(pdf_path, total, api_key="", progress_cb=None):
 
 def get_thumb_b64(doc, pg, width=220):
     page = doc[pg]
-    pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72))
+    pix = page.get_pixmap(matrix=fitz.Matrix(60 / 72, 60 / 72))
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    crop = img.crop((0, 0, img.width, int(img.height * 0.20)))
+    crop = img
     r = width / crop.width
     crop = crop.resize((width, int(crop.height * r)), Image.LANCZOS)
     buf = io.BytesIO()
@@ -350,7 +421,7 @@ st.markdown("""
 <div class="main-header">
     <h1>📋 Foliador de Obras Sociales</h1>
     <div class="accent-line"></div>
-    <p>Extrae códigos de cuenta, cruza con la base de profesionales y genera el Excel</p>
+    <p>Lee la cuenta manuscrita de las hojas separadoras, cruza con la base de profesionales y genera el Excel</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -368,7 +439,7 @@ with col_base:
 api_key = get_api_key()
 if not api_key:
     with st.expander("🔑 API Key de Anthropic (opcional pero recomendado)"):
-        st.markdown('<p class="info-text">Con la API Key, la app usa <b>Claude Vision</b> para leer los códigos manuscritos con mucha mayor precisión que Tesseract OCR. Sin ella, funciona igual pero con OCR tradicional.</p>', unsafe_allow_html=True)
+        st.markdown('<p class="info-text">Con la API Key, la app usa <b>Claude Vision</b> para leer las cuentas manuscritas de las hojas separadoras con mucha mayor precisión que Tesseract OCR. Sin ella, funciona igual pero con OCR tradicional.</p>', unsafe_allow_html=True)
         api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
         st.markdown('<p class="info-text">Para Streamlit Cloud: agregala en Settings → Secrets como <code>ANTHROPIC_API_KEY = "sk-ant-..."</code></p>', unsafe_allow_html=True)
 
@@ -401,7 +472,7 @@ if uploaded_pdf:
         st.session_state.update({'results': results, 'candidates': candidates, 'scanned': True, 'pdf_path': tmp_path})
 
         matches = sum(1 for _, (c, _) in results.items() if do_lookup(c, base_lookup))
-        st.markdown(f'<div class="stat-row"><div class="stat-box"><div class="stat-number">{len(candidates)}</div><div class="stat-label">Candidatas</div></div><div class="stat-box"><div class="stat-number">{len(results)}</div><div class="stat-label">Leídos</div></div><div class="stat-box"><div class="stat-number">{matches}/{len(results)}</div><div class="stat-label">Cruzados</div></div><div class="stat-box"><div class="stat-number">{elapsed:.1f}s</div><div class="stat-label">Tiempo</div></div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stat-row"><div class="stat-box"><div class="stat-number">{len(candidates)}</div><div class="stat-label">Separadoras</div></div><div class="stat-box"><div class="stat-number">{len(results)}</div><div class="stat-label">Leídos</div></div><div class="stat-box"><div class="stat-number">{matches}/{len(results)}</div><div class="stat-label">Cruzados</div></div><div class="stat-box"><div class="stat-number">{elapsed:.1f}s</div><div class="stat-label">Tiempo</div></div></div>', unsafe_allow_html=True)
         no_match = len(results) - matches
         if matches > 0 and no_match == 0:
             st.success(f"**{matches}** códigos detectados y **todos cruzados** con la base.")
@@ -410,13 +481,13 @@ if uploaded_pdf:
         elif results:
             st.warning("Códigos detectados pero sin match. Corregí en la tabla y re-cruzá.")
         else:
-            st.warning("No se detectaron códigos. Ingresalos manualmente.")
+            st.warning("No se detectaron hojas separadoras con cuenta manuscrita. Ingresá las cuentas manualmente.")
 
     if st.session_state.get('scanned'):
         results = st.session_state['results']
         candidates = st.session_state['candidates']
         if candidates:
-            st.markdown("**Páginas candidatas** — descartá las que no tengan código manuscrito:")
+            st.markdown("**Hojas separadoras detectadas** — descartá las que no sean una hoja en blanco con la cuenta manuscrita:")
             doc2 = fitz.open(st.session_state.get('pdf_path', tmp_path))
             per_page = 12
             total_groups = math.ceil(len(candidates)/per_page)
@@ -517,4 +588,4 @@ if uploaded_pdf:
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div style="text-align:center;padding:3rem 0 1.5rem;border-top:1px solid rgba(59,130,246,.06);margin-top:2rem"><p style="font-size:.72rem;color:#475569;letter-spacing:.5px;font-family:\'DM Sans\',sans-serif">FOLIADOR DE OBRAS SOCIALES · v4.3 · Detección enfocada en margen manuscrito</p></div>', unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;padding:3rem 0 1.5rem;border-top:1px solid rgba(59,130,246,.06);margin-top:2rem"><p style="font-size:.72rem;color:#475569;letter-spacing:.5px;font-family:\'DM Sans\',sans-serif">FOLIADOR DE OBRAS SOCIALES · v5.0 · Lectura de hojas separadoras manuscritas</p></div>', unsafe_allow_html=True)
